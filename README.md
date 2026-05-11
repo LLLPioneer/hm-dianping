@@ -14,6 +14,7 @@
 | ORM | MyBatis-Plus 3.4.3 |
 | 数据库 | MySQL 5.x (数据库名 `hm_dianping`) |
 | 缓存/分布式 | Redis (Lettuce + Redisson 3.27.2) |
+| 消息队列 | RabbitMQ 3.8+ |
 | 工具库 | Hutool 5.7.17、Lombok 1.18.30 |
 | AOP | AspectJ Weaver |
 
@@ -34,6 +35,7 @@ com.hmdp.HmDianPingApplication
 - 端口：`8081`
 - MySQL：`localhost:3306/hm_dianping`
 - Redis：`127.0.0.1:6379`，database 1，Lettuce 连接池（max-active=10）
+- RabbitMQ：`192.168.59.130:5672`，virtual-host `/test`
 - Jackson：序列化时排除 null 字段
 
 ---
@@ -48,10 +50,11 @@ hm-dianping/
 │   ├── main/
 │   │   ├── java/com/hmdp/
 │   │   │   ├── HmDianPingApplication.java          # 启动类
-│   │   │   ├── config/                              # Spring 配置（4 个文件）
+│   │   │   ├── config/                              # Spring 配置（5 个文件）
 │   │   │   ├── controller/                          # REST 控制器（9 个文件）
 │   │   │   ├── dto/                                 # 数据传输对象（4 个文件）
 │   │   │   ├── entity/                              # 数据库实体（10 个文件）
+│   │   │   ├── listener/                            # 消息监听器（1 个文件）
 │   │   │   ├── mapper/                              # MyBatis-Plus Mapper（10 个文件）
 │   │   │   ├── service/                             # Service 接口（10 个文件）
 │   │   │   │   └── impl/                            # Service 实现（10 个文件）
@@ -83,6 +86,7 @@ hm-dianping/
 | `MybatisConfig.java` | 配置 MyBatis-Plus MySQL 分页插件 |
 | `RedisConfiguration.java` | 三个 Bean：(1) `RedisTemplate`（String key + GenericJackson2Json value 序列化）；(2) Spring `CacheManager`（Redis 缓存，30 分钟 TTL，不缓存 null）；(3) `RedissonClient` 分布式锁客户端 |
 | `WebExceptionAdvice.java` | 全局异常处理 `@RestControllerAdvice`，捕获 `RuntimeException` 返回统一错误响应 |
+| `RabbitMQConfig.java` | RabbitMQ 配置：定义订单交换机、队列、死信队列及 JSON 消息转换器 |
 
 ### 2. 控制器层（controller/）
 
@@ -112,7 +116,7 @@ hm-dianping/
 | `SeckillVoucher` | `tb_seckill_voucher` | 秒杀券（库存、开始/结束时间），与 tb_voucher 一对一 |
 | `VoucherOrder` | `tb_voucher_order` | 订单（用户ID、券ID、支付类型、状态）。状态流转：未支付→已支付→已使用→已取消→退费中→已退费 |
 | `Blog` | `tb_blog` | 用户帖子/评测（商户ID、用户ID、标题、图片、内容、点赞数、评论数）。含 transient 字段 `icon`、`name`、`isLike` |
-| `BlogComments` | `tb_blog_comments` | 评论（用户ID、博客ID、父ID 用于楼层嵌套、回复ID、内容、状态） |
+| `BlogComments` | `tb_blog_comments` | 评论（用户ID、博客ID、父ID 用于楼层嵌套、回复ID、内容，状态） |
 | `Follow` | `tb_follow` | 社交关注关系（用户ID、被关注用户ID） |
 
 ### 4. Mapper 层（mapper/）
@@ -133,7 +137,7 @@ Mapper 列表：`BlogCommentsMapper`、`BlogMapper`、`FollowMapper`、`SeckillV
 | `IShopService` / `ShopServiceImpl` | `igetById()` — Cache-Aside 模式 + 互斥锁防缓存穿透/击穿；`iupdate()` — 先写库再删缓存 |
 | `IShopTypeService` / `ShopTypeServiceImpl` | 基础 CRUD，按 sort 排序列表查询 |
 | `IVoucherService` / `VoucherServiceImpl` | `addSeckillVoucher()` — 事务方法，保存券 + 秒杀记录 + 预加载库存到 Redis；`queryVoucherOfShop()` — 调用自定义 Mapper |
-| `IVoucherOrderService` / `VoucherOrderServiceImpl` | **最复杂的 Service**。`seckillVoucherOrder2()` 使用 Lua 脚本实现原子库存校验 + 订单去重，然后通过 `BlockingQueue` 异步落库。还包含使用 `synchronized` 和 `Redisson` 分布式锁的旧实现。使用 `AopContext.currentProxy()` 解决事务代理问题 |
+| `IVoucherOrderService` / `VoucherOrderServiceImpl` | **最复杂的 Service**. `seckillVoucherOrder2()` 使用 Lua 脚本实现原子库存校验 + 订单去重，通过 RabbitMQ 发送订单消息。支持消息重试与死信队列处理失败订单。使用 `AopContext.currentProxy()` 解决事务代理问题 |
 | `IBlogService` / `BlogServiceImpl` | 基础 CRUD |
 | `IFollowService` / `FollowServiceImpl` | 基础 CRUD |
 | `IUserInfoService` / `UserInfoServiceImpl` | 基础 CRUD |
@@ -165,6 +169,12 @@ Mapper 列表：`BlogCommentsMapper`、`BlogMapper`、`FollowMapper`、`SeckillV
 | `PasswordEncoder` | 自定义加盐 MD5 密码哈希 |
 | `SystemConstants` | 系统常量：图片上传目录（nginx 路径）、分页大小、错误消息 |
 | `GlobalUniqueIDGenerator` | 类 Snowflake 分布式 ID 生成器，使用 Redis `INCR` + 位运算（时间戳位 + 计数器位） |
+
+### 8. 消息监听层（listener/）
+
+| 类 | 职责 |
+|----|------|
+| `OrderMessageListener` | 监听 RabbitMQ 订单队列，处理 `VoucherOrder` 消息，调用 `createVoucherOrder` 服务方法，自动重试 3 次失败消息 |
 
 ---
 
@@ -217,6 +227,12 @@ Controller（REST 端点，请求/响应映射）
 Service（业务逻辑、缓存策略、分布式锁、事务）
     │
     ▼
+RabbitMQ（订单消息队列，死信队列处理失败消息）
+    │
+    ▼
+OrderMessageListener（消费者处理订单）
+    │
+    ▼
 Mapper（MyBatis-Plus ORM，BaseMapper CRUD + 自定义 XML SQL）
     │
     ▼
@@ -230,6 +246,6 @@ MySQL 数据库
 | **认证** | Token 机制，Redis Hash 存储 UserDTO，非 HttpSession |
 | **缓存** | 多级策略：Spring Cache 注解、手动 Cache-Aside + 互斥锁、逻辑过期 + 异步重建 |
 | **分布式锁** | 双重实现：自定义 `SimpleRedisLock`（SET NX + Lua）和 Redisson |
-| **异步下单** | `BlockingQueue` + 单线程 `ExecutorService` 异步落库，应对秒杀高并发 |
+| **异步下单** | RabbitMQ 消息队列实现，通过 Direct Exchange 和 Queue 确保消息可靠传递，支持死信队列重试机制，具备水平扩展能力 |
 | **原子操作** | Lua 脚本保证库存扣减与订单去重的原子性 |
 | **全局 ID** | Redis `INCR` + 位运算的类 Snowflake ID 生成器 |
